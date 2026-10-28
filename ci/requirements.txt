@@ -1,0 +1,21 @@
+# Pinned Python dependencies for west, Zephyr CMake/devicetree and this CI.
+# The versions reflect the inspected local Python 3.12 environment where applicable.
+attrs==26.1.0
+cmake==4.4.4
+colorama==0.4.6
+docopt==0.6.2
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+ninja==1.13.0
+packaging==26.3
+pyelftools==0.33
+pykwalify==1.8.0
+python-dateutil==3.0.0
+PyYAML==6.0.3
+referencing==0.37.0
+rpds-py==2026.9.1
+ruamel.yaml==0.19.1
+six==1.17.0
+typing_extensions==4.16.0
+tzdata==2026.5
+west==1.5.0

@@ -14,6 +14,7 @@ inline constexpr int sample_queue_capacity = 4;
 inline constexpr int report_queue_capacity = 16;
 inline constexpr std::int32_t first_sample_timeout_ms = 750;
 inline constexpr std::int32_t summary_period_ms = 2000;
+inline constexpr std::int32_t stack_report_period_ms = 10000;
 
 static_assert(acquisition_priority < monitoring_priority &&
               monitoring_priority < reporting_priority);

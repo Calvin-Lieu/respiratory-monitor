@@ -1,0 +1,83 @@
+name: Zephyr CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qemu:
+    name: QEMU build, unit and integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: workspace/app
+    env:
+      ZEPHYR_REVISION: ec98918869caeb2ddaef6e698f9ff36fb60a97ac
+      ZEPHYR_SDK_VERSION: 1.0.1
+      ZEPHYR_TOOLCHAIN_VARIANT: zephyr
+      ZEPHYR_SDK_INSTALL_DIR: ${{ github.workspace }}/workspace/zephyr-sdk-1.0.1
+      PYTHONDONTWRITEBYTECODE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out application
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          path: workspace/app
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install host device-tree compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends device-tree-compiler
+
+      - name: Install pinned build tools
+        run: python -m pip install -r ci/requirements.txt
+
+      - name: Prepare pinned Zephyr workspace
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/zephyrproject-rtos/zephyr.git ../zephyr
+          git -C ../zephyr checkout --detach "$ZEPHYR_REVISION"
+          test "$(git -C ../zephyr rev-parse HEAD)" = "$ZEPHYR_REVISION"
+          west init -l ../zephyr
+          west update cmsis_6
+
+      - name: Install verified SDK and ARM toolchain
+        run: |
+          sdk_url="https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZEPHYR_SDK_VERSION}"
+          sdk_archive="zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-x86_64_minimal.tar.xz"
+          arm_archive="toolchain_gnu_linux-x86_64_arm-zephyr-eabi.tar.xz"
+          curl --fail --location --retry 3 -o "../$sdk_archive" "$sdk_url/$sdk_archive"
+          curl --fail --location --retry 3 -o "../$arm_archive" "$sdk_url/$arm_archive"
+          echo "ca9bc0ff66fafca1dac9d592a36d953cf16d096a9d09b1c0357f021cf9f6a7eb  ../$sdk_archive" | sha256sum -c -
+          echo "21b85981cb5a1818d9bc53d82af80f208946ec038b982ff1907287572ed3a634  ../$arm_archive" | sha256sum -c -
+          tar -xf "../$sdk_archive" -C ..
+          mkdir -p "$ZEPHYR_SDK_INSTALL_DIR/gnu"
+          tar -xf "../$arm_archive" -C "$ZEPHYR_SDK_INSTALL_DIR/gnu"
+          (cd "$ZEPHYR_SDK_INSTALL_DIR" && ./setup.sh -h)
+
+      - name: Build application
+        run: west build -p always -b qemu_cortex_m3 -d build-ci .
+
+      - name: Build and run Zephyr unit tests
+        run: |
+          west build -p always -b qemu_cortex_m3 -d build-ci-ztest tests/ztest
+          python tests/run_qemu_ci.py --build-dir build-ci-ztest --log build-ci-unit.log --mode unit
+
+      - name: Run normal pipeline integration test
+        run: python tests/run_qemu_ci.py --build-dir build-ci --log build-ci-normal.log --mode normal
+
+      - name: Build and run queue-overflow integration test
+        run: |
+          west build -p always -b qemu_cortex_m3 -d build-ci-stress . -- -DRESPMON_PIPELINE_STRESS_TEST=ON
+          python tests/run_qemu_ci.py --build-dir build-ci-stress --log build-ci-stress.log --mode stress

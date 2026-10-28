@@ -76,8 +76,8 @@ contain values, not pointers to producer-owned mutable data.
 | reporting | 5 | 2048 | Consume reports, log events and summaries |
 | main | default (0) | 1024 | Start threads once and return |
 
-Lower numbers take priority. Stack sizes are configured reservations, not measured
-high-water marks. Stack sentinels and Zephyr assertions are enabled. Acquisition
+Lower numbers take priority. Stack sizes are configured reservations. Stack
+sentinels, stack initialization and Zephyr assertions are enabled. Acquisition
 skips missed periods instead of bursting catch-up samples. It never waits for
 queue capacity: `k_msgq_put(..., K_NO_WAIT)` rejects the newest sample when the
 four-slot sample queue is full, preserving the FIFO backlog and incrementing its
@@ -108,12 +108,16 @@ continues. Summaries expose acquisition/monitoring report losses as `report_drop
 Counters are unsigned 64-bit values (wrap modulo 2^64). Snapshot counts may lag
 and do not constitute an atomic cross-thread measurement.
 
-Only the reporter writes runtime logs: thread starts, entry into queue-full, health
-reason changes, state/reason changes and two-second summaries. Persistent faults
-do not produce a log line on every sample. Its potentially
-slow console cannot block acquisition or monitoring. `acq_scenario` refers to the
-latest acquisition snapshot; `READING` timestamps/sequences refer to the latest
-processed sample and can differ during backlog or missing input.
+After startup, only the reporter writes application logs. Zephyr logging uses
+INFO for startup, recovery and two-second `SUMMARY` snapshots, WARNING for health
+changes and queue overflow, and ERROR for confirmed FAULT transitions/reason
+changes. Persistent faults do not produce a log line on every sample. Detailed
+`COUNTERS` and `STACK` snapshots appear every ten seconds. Logging is configured
+in immediate mode, so console formatting runs synchronously in the lower-priority
+reporter; acquisition and monitoring never write to the console. Slow output can
+fill the best-effort report queue, whose producer loss counts are reported.
+`acq_scenario` is the latest acquisition snapshot; sample timestamps/sequences
+refer to the latest processed sample and can differ during backlog or missing input.
 
 A test-only build stalls monitoring once for 3000 ms to force sample queue overflow:
 
@@ -167,6 +171,39 @@ before subtraction. Application deadlines assume uptime does not reach that
 limit during a run. Counters use unsigned 64-bit arithmetic and wrap modulo 2^64;
 state and frozen streak counters saturate at their configured bounds.
 
+## Resource observations
+
+The configured sample queue has four `SensorSample` entries, the report queue has
+16 entries, and the moving-average buffer holds four samples. The sampling period
+is 500 ms. The thread table above lists requested stack sizes and priorities.
+Queues, domain objects and application threads use static storage. Runtime
+application source was inspected for allocation calls and `new`/`delete`; none
+are intentionally used. The built Zephyr configuration has
+`CONFIG_HEAP_MEM_POOL_SIZE=0`, exceptions and RTTI disabled. This inspection does
+not establish allocation behavior of every Zephyr component.
+
+`CONFIG_INIT_STACKS` and `CONFIG_THREAD_STACK_INFO` allow the reporter to call
+`k_thread_stack_space_get()` for the three pipeline threads. At 40 seconds of
+simulated time in one normal QEMU run on 29 October 2026, the observed high-water
+usage was 476/1024 bytes for acquisition, 852/2048 for monitoring, and 1100/2048
+for reporting. These are observed stack watermarks during that run, not proven
+worst-case bounds; different workloads or compiler settings can change them. If
+inspection is unavailable or returns an error, a warning is logged instead of a
+fabricated value.
+
+For the normal `qemu_cortex_m3/ti_lm3s6965` build using Zephyr
+`v4.5.0-rc3-40-gec98918869ca` on 29 October 2026, the clean build's linker reported
+29,064 bytes in FLASH (256 KiB region) and 12,936 bytes in RAM (64 KiB region).
+The Zephyr report targets gave symbol-accounted totals of 29,052 bytes ROM and
+12,933 bytes RAM; those report totals differ slightly from the linker region totals.
+These are build-specific observations, not runtime memory peaks. Reproduce them
+from the repository root after building the normal application:
+
+```sh
+west build -d build -t rom_report
+west build -d build -t ram_report
+```
+
 ## Monitoring states and transitions
 
 `MonitorConfig` is a copied configuration object supplied to `StateMachine`.
@@ -213,8 +250,8 @@ Counters saturate at their configured limits instead of overflowing.
 `StateMachineResult` returns `state`, `transitioned`, `fault_reason`, and
 `reason_changed`. `transitioned` means only a change of state. The application
 prints a `STATE` event when state or active reason changes, including previous
-and current state and a named reason. The lower-priority reporter prints state
-events and periodic summaries; monitoring never calls `printk`.
+and current state and a named reason. The lower-priority reporter emits state
+events and periodic summaries through Zephyr logging; monitoring does not log.
 
 Reasons are `none`, `pressure_threshold`, `airflow_threshold`, `invalid_sample`,
 `sensor_timeout`, `stale_timestamp`, `sequence_gap`, `sequence_order`,
@@ -282,13 +319,14 @@ west build -t run
 ```
 
 Expected startup includes `Respiratory monitor starting (simulated educational data)`,
-queue configuration and all three thread startup records. `STATE` events show
-transitions and reason changes. `SUMMARY` lines show counters and current state
-every two seconds; `READING` lines show the latest processed raw/filtered values,
-sequence, source timestamp and validity. These are periodic snapshots, not a log
-of every sample. The second input's 101 Pa / 41 mL/min averages to 100 Pa / 40 mL/min
-with integer truncation. `latest_event_sample=0` marks a summary whose latest
-monitoring event was a timeout; the displayed reading is retained history.
+queue configuration and all three thread startup records. Named `STATE` events
+show transitions and reason changes. Every two seconds, `SUMMARY` records contain
+state, active fault, acquisition scenario, raw and filtered readings, sequence,
+validity, and total/valid/invalid/dropped counts. Every ten seconds, `COUNTERS`
+shows detailed counts and `STACK` shows observed stack high-water values. During a
+timeout, `latest_event_sample=0` and `filtered_valid=0`; the displayed values are
+retained history. Counts from the two producer threads are separate snapshots and
+can lag independently. See `tests/check_pipeline_log.py` for QEMU log validation.
 Exit QEMU with Ctrl-A then X. Build outputs are ignored; do not commit them.
 The Zephyr source checkout must remain unchanged.
 Toolchain capability caches default to the ignored `.cache/zephyr` directory.
@@ -318,6 +356,39 @@ Twister writes its test results, including `twister.json` and XML reports, under
 the ignored `build-twister/` directory. Its summary distinguishes executed tests
 from configurations that were only built. Exit with a nonzero status indicates a
 test, build, or runner failure.
+
+## GitHub Actions CI
+
+The standalone workflow is `.github/workflows/zephyr-ci.yml`. It runs on pushes,
+pull requests and manual dispatch, with read-only repository permissions. It
+checks the application out under a fresh workspace and uses Zephyr commit
+`ec98918869caeb2ddaef6e698f9ff36fb60a97ac`. `west update cmsis_6` fetches the
+CMSIS module revision pinned in that Zephyr commit's manifest. The workflow uses
+SDK 1.0.1, verifies the Linux minimal SDK and ARM toolchain archives against
+committed SHA-256 values, and installs the host tools outside the application
+checkout. It pins the GitHub Actions by commit and the Python build dependencies
+in `ci/requirements.txt`. The runner is Ubuntu 24.04 with Python 3.12; OS package
+updates and Python patch versions can still change, so this does not promise
+bit-for-bit reproducibility. No dependency cache is configured.
+
+CI builds the normal application, builds and runs the Zephyr ztests, then runs
+both the normal and forced sample-queue-overflow pipeline scenarios on QEMU.
+`tests/run_qemu_ci.py` captures bounded output, fails on timeout or early exit,
+exits QEMU using its monitor command, and checks ztest results or invokes
+`tests/check_pipeline_log.py`. Reproduce the run steps in an existing workspace:
+
+```sh
+west build -p always -b qemu_cortex_m3 -d build-ci .
+west build -p always -b qemu_cortex_m3 -d build-ci-ztest tests/ztest
+python tests/run_qemu_ci.py --build-dir build-ci-ztest --log build-ci-unit.log --mode unit
+python tests/run_qemu_ci.py --build-dir build-ci --log build-ci-normal.log --mode normal
+west build -p always -b qemu_cortex_m3 -d build-ci-stress . -- -DRESPMON_PIPELINE_STRESS_TEST=ON
+python tests/run_qemu_ci.py --build-dir build-ci-stress --log build-ci-stress.log --mode stress
+```
+
+The checkout has no configured GitHub remote, so no repository-specific status
+badge is included. GitHub-hosted installation and the remote workflow require an
+actual run on GitHub to verify; local checks do not establish a remote CI result.
 
 ## Host tests
 
