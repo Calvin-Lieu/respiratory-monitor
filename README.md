@@ -10,7 +10,7 @@ its values and behavior do not define clinical thresholds.
 - `include/respmon/ring_buffer.hpp`: fixed-capacity, oldest-first ring buffer.
 - `include/respmon/filter.hpp`, `src/filter.cpp`: moving average filter.
 - `include/respmon/sensor_simulator.hpp`, `src/sensor_simulator.cpp`: bounded ramps.
-- `include/respmon/state_machine.hpp`, `src/state_machine.cpp`: validity states.
+- `include/respmon/state_machine.hpp`, `src/state_machine.cpp`: debounced monitoring states.
 - `src/main.cpp`: Zephyr clock, scheduling and console output.
 - `tests/`: standalone host tests of the RTOS-independent domain.
 
@@ -40,21 +40,73 @@ division. Otherwise its timestamp is that of the newest retained sample.
 Compile-time window bounds ensure 64-bit sums can hold even extreme 32-bit
 inputs. Both pressure and airflow use the same window.
 
-The state machine starts in `initializing` (0), enters `monitoring` (1) on valid
-processed input, and enters `sensor_fault` (2) on invalid input. Fault reasons
-are `none` (0), `invalid_sample` (1), and `sensor_timeout` (2). Missing acquisitions
-clear filter history and call the independent timeout event on the state machine.
-No placeholder enters the filter. Recovery is immediate on the next valid input.
-Elevated/critical classification, frozen-value detection, configurable timeout
-durations, alarm persistence/hysteresis, respiratory metrics, execution-health
-counters and separate telemetry are future work. Scenario labels are never used
-to select monitoring states.
+The independent state machine consumes filtered samples, not simulator labels.
+See the transition rules below. Frozen-value detection, configurable elapsed-time
+timeout detection, respiratory metrics, execution-health counters and separate
+telemetry remain future work. Missing acquisitions clear filter history and
+supply explicit timeout events; no placeholder enters the filter.
 
 Runtime domain code uses fixed storage, bounded execution, no dynamic allocation,
 exceptions or RTTI. Containers and domain objects have a single owner and are
 not thread-safe. The main loop samples every 500 ms against absolute deadlines,
 skipping missed periods; console output remains synchronous in this foundation.
 No timing or clinical performance is claimed.
+
+## Monitoring states and transitions
+
+`MonitorConfig` is a copied configuration object supplied to `StateMachine`.
+Defaults below are arbitrary educational simulation settings, not clinically
+validated thresholds. All comparisons are inclusive and classify upper excursions
+only; pressure is integer Pa and airflow is integer mL/min.
+
+| Setting | Default |
+|---|---|
+| Warning pressure / airflow | 180 Pa / 70 mL/min |
+| Fault pressure / airflow | 350 Pa / 140 mL/min |
+| Consecutive abnormal events for WARNING | 3 |
+| Consecutive fault-level events for FAULT | 3 |
+| Consecutive normal samples for initialisation/recovery | 4 |
+
+Each `update()` or `on_timeout()` is exactly one acquisition event. Callers must
+supply each acquisition once; sequence freshness/deduplication is not implemented.
+An invalid sample is fault-level regardless of numeric fields. A timeout is also
+fault-level. For valid input, either fault threshold is fault-level; otherwise
+either warning threshold is warning-level. Normal means valid and strictly below
+both warning thresholds. Pressure has reason priority if both fault thresholds
+are exceeded. Low excursions are not classified by this upper-threshold demo.
+
+| Current state | Condition | Result |
+|---|---|---|
+| INITIALISING | Four consecutive normal samples | MONITORING |
+| INITIALISING or MONITORING | Three consecutive abnormal events | WARNING |
+| Any state | Three consecutive fault-level events | FAULT |
+| WARNING or FAULT | Four consecutive normal samples | MONITORING; reason cleared |
+| FAULT | Warning-level input or incomplete recovery | Remain FAULT; retain reason |
+| Any state | No rule satisfied | Retain state |
+
+Fault-level events also count as abnormal. If warning and fault entry qualify
+on the same event, FAULT wins. A normal sample resets both abnormal entry counters;
+warning-only input resets the fault counter; any abnormal event resets recovery.
+Fault-level events with different causes can form one consecutive streak. The
+most recent event supplies the active reason once the fault streak qualifies.
+While the streak remains qualified, a different fault-level cause updates the
+reason without changing state. Recovery retains the last reason until complete.
+Counters saturate at their configured limits instead of overflowing.
+
+`StateMachineResult` returns `state`, `transitioned`, `fault_reason`, and
+`reason_changed`. `transitioned` means only a change of state. The application
+prints a `STATE` event when state or active reason changes, including previous
+and current state and a named reason. Per-sample `SIM` telemetry contains readings
+and validity without repeating the monitoring state.
+
+Reasons are `none`, `pressure_threshold`, `airflow_threshold`, `invalid_sample`,
+`sensor_timeout`, and `invalid_configuration`. Before fault confirmation there
+is no active fault reason; WARNING has reason `none`. Invalid configuration
+(warning threshold >= fault threshold or any count < 2) produces an immediate,
+latched FAULT on evaluation, with reason `invalid_configuration`; it cannot
+recover without constructing a machine with valid settings. `reset()` returns
+to INITIALISING and clears all counters/reasons, preserving configuration.
+The default configuration is checked at compile time.
 
 ## Deterministic scenarios
 
@@ -111,8 +163,8 @@ west build -t run
 
 Expected startup includes `Respiratory monitor starting (simulated educational data)`
 followed by `SIM` records showing the active scenario, sequence number, validity,
-raw and filtered pressure and airflow with explicit units, and numeric state/fault
-codes. Missing acquisitions log `available=0` without measurement values. For example, the second input is
+raw and filtered pressure and airflow with explicit units. Separate `STATE`
+events report named states and reasons only when they change. Missing acquisitions log `available=0` without measurement values. For example, the second input is
 101 Pa and 41 mL/min; its two-sample averages are 100 Pa and 40 mL/min due to
 integer truncation. Later samples show full-window smoothing and overwrite.
 Exit QEMU with Ctrl-A then X. Build outputs are ignored; do not commit them.
@@ -136,6 +188,8 @@ capacity one, three complete simulator cycles, scenario boundaries, deterministi
 replay/reset, missing-sample sequence gaps, frozen values, pipeline fault/recovery,
 empty/partial/full filter windows, comparison
 against independent sums over many wraps, negative rounding, invalid-input reset, extreme integer
-inputs, and state fault/recovery/reset transitions. Checks remain active in
+inputs, and complete filtered-pipeline cycles. A separate state-machine suite checks
+threshold equality and channel independence, interrupted streaks, latched faults,
+recovery, reason changes, custom/invalid configuration, and reset. Checks remain active in
 release builds. Build and test every milestone before creating a local commit;
 do not push to a remote.

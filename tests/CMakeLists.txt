@@ -9,3 +9,10 @@ set_target_properties(domain_tests PROPERTIES
 target_compile_options(domain_tests PRIVATE
     -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti)
 add_test(NAME respmon_domain COMMAND domain_tests)
+add_executable(state_machine_tests state_machine_tests.cpp ../src/state_machine.cpp)
+target_include_directories(state_machine_tests PRIVATE ../include)
+set_target_properties(state_machine_tests PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(state_machine_tests PRIVATE
+    -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti)
+add_test(NAME respmon_state_machine COMMAND state_machine_tests)

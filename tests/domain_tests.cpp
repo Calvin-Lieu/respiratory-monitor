@@ -72,8 +72,10 @@ int main()
             scenario_filter.reset();
             scenario_monitor.on_timeout();
             CHECK(!scenario_filter.average().valid);
-            CHECK(scenario_monitor.state() == respmon::MonitorState::sensor_fault);
-            CHECK(scenario_monitor.fault() == respmon::FaultReason::sensor_timeout);
+            if (phase + 1 >= respmon::MonitorConfig{}.fault_samples) {
+                CHECK(scenario_monitor.state() == respmon::MonitorState::FAULT);
+                CHECK(scenario_monitor.fault() == respmon::FaultReason::sensor_timeout);
+            }
             continue;
         }
         const auto& raw = reading.sample;
@@ -108,11 +110,20 @@ int main()
         scenario_monitor.update(processed);
         CHECK(processed.sequence == i && processed.timestamp_ms == now);
         CHECK(processed.valid == !invalid);
-        CHECK(scenario_monitor.fault() == (invalid ? respmon::FaultReason::invalid_sample
-                                                   : respmon::FaultReason::none));
+        if (phase + 1 == duration) {
+            const auto expected_state = scenario == respmon::SensorScenario::elevated
+                ? respmon::MonitorState::WARNING
+                : (scenario == respmon::SensorScenario::critical || invalid
+                    ? respmon::MonitorState::FAULT : respmon::MonitorState::MONITORING);
+            CHECK(scenario_monitor.state() == expected_state);
+            const auto expected_fault = invalid ? respmon::FaultReason::invalid_sample
+                : (scenario == respmon::SensorScenario::critical
+                    ? respmon::FaultReason::pressure_threshold : respmon::FaultReason::none);
+            CHECK(scenario_monitor.fault() == expected_fault);
+        }
         if (scenario == respmon::SensorScenario::recovery && phase == 0) {
             CHECK(processed.pressure_pa == 100 && processed.airflow_ml_per_min == 40);
-            CHECK(scenario_monitor.state() == respmon::MonitorState::monitoring);
+            CHECK(scenario_monitor.state() == respmon::MonitorState::FAULT);
         }
     }
     sensor.reset();
@@ -165,20 +176,6 @@ int main()
         CHECK(sample.pressure_pa == std::numeric_limits<std::int32_t>::max());
         CHECK(sample.airflow_ml_per_min == std::numeric_limits<std::int32_t>::min());
     }
-    respmon::StateMachine monitor;
-    CHECK(monitor.state() == respmon::MonitorState::initializing);
-    CHECK(monitor.fault() == respmon::FaultReason::none);
-    monitor.update(sample);
-    CHECK(monitor.state() == respmon::MonitorState::monitoring);
-    monitor.update({});
-    CHECK(monitor.state() == respmon::MonitorState::sensor_fault);
-    CHECK(monitor.fault() == respmon::FaultReason::invalid_sample);
-    monitor.update(sample);
-    CHECK(monitor.state() == respmon::MonitorState::monitoring);
-    CHECK(monitor.fault() == respmon::FaultReason::none);
-    monitor.reset();
-    CHECK(monitor.state() == respmon::MonitorState::initializing);
-    CHECK(monitor.fault() == respmon::FaultReason::none);
     std::puts("All domain buffering, filtering and foundation checks passed");
     return 0;
 }

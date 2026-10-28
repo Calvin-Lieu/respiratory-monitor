@@ -19,6 +19,9 @@ struct ProcessedSample {
     bool valid{false};
     std::uint32_t sequence{0}; // Newest retained input's sequence.
 };
-enum class MonitorState : std::uint8_t { initializing, monitoring, sensor_fault };
-enum class FaultReason : std::uint8_t { none, invalid_sample, sensor_timeout };
+enum class MonitorState : std::uint8_t { INITIALISING, MONITORING, WARNING, FAULT };
+enum class FaultReason : std::uint8_t {
+    none, invalid_sample, sensor_timeout, pressure_threshold, airflow_threshold,
+    invalid_configuration
+};
 } // namespace respmon
