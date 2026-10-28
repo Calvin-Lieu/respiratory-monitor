@@ -1,0 +1,29 @@
+# Zephyr/CMake build output
+build/
+build-*/
+
+# Local environments and caches
+.venv/
+.cache/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Generated test, compiler and Python outputs
+twister-out*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+Testing/
+*.o
+*.obj
+*.a
+*.elf
+*.bin
+*.hex
+*.map
+__pycache__/
+*.pyc
