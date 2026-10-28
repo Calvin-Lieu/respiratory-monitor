@@ -6,6 +6,8 @@ namespace respmon {
 class StateMachine {
 public:
     void update(const ProcessedSample& sample) noexcept;
+    // Called by acquisition orchestration when an expected sample is absent.
+    void on_timeout() noexcept;
     void reset() noexcept;
     MonitorState state() const noexcept { return state_; }
     FaultReason fault() const noexcept { return fault_; }

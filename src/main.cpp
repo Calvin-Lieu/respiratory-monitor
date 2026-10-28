@@ -13,18 +13,38 @@ int main()
     printk("Respiratory monitor starting (simulated educational data)\n");
     std::int64_t next_sample_ms = k_uptime_get();
     while (true) {
-        const auto raw = sensor.read(k_uptime_get());
-        const auto sample = filter.process(raw);
-        monitor.update(sample);
-        printk("SIM time=%lld ms raw_pressure=%ld Pa filtered_pressure=%ld Pa "
-               "raw_airflow=%ld mL/min filtered_airflow=%ld mL/min state=%u fault=%u\n",
-               static_cast<long long>(sample.timestamp_ms),
-               static_cast<long>(raw.pressure_pa),
-               static_cast<long>(sample.pressure_pa),
-               static_cast<long>(raw.airflow_ml_per_min),
-               static_cast<long>(sample.airflow_ml_per_min),
-               static_cast<unsigned int>(monitor.state()),
-               static_cast<unsigned int>(monitor.fault()));
+        const auto acquisition_ms = k_uptime_get();
+        const auto reading = sensor.read(acquisition_ms);
+        if (reading.available) {
+            const auto& raw = reading.sample;
+            const auto sample = filter.process(raw);
+            monitor.update(sample);
+            printk("SIM time=%lld ms scenario=%s seq=%lu valid=%u "
+                   "raw_pressure=%ld Pa filtered_pressure=%ld Pa "
+                   "raw_airflow=%ld mL/min filtered_airflow=%ld mL/min "
+                   "filtered_valid=%u state=%u fault=%u\n",
+                   static_cast<long long>(raw.timestamp_ms),
+                   respmon::scenario_name(reading.scenario),
+                   static_cast<unsigned long>(raw.sequence),
+                   static_cast<unsigned int>(raw.valid),
+                   static_cast<long>(raw.pressure_pa),
+                   static_cast<long>(sample.pressure_pa),
+                   static_cast<long>(raw.airflow_ml_per_min),
+                   static_cast<long>(sample.airflow_ml_per_min),
+                   static_cast<unsigned int>(sample.valid),
+                   static_cast<unsigned int>(monitor.state()),
+                   static_cast<unsigned int>(monitor.fault()));
+        } else {
+            // A missing acquisition is not an invalid measurement. Clear stale
+            // history and report the absence without inserting a placeholder.
+            filter.reset();
+            monitor.on_timeout();
+            printk("SIM time=%lld ms scenario=%s available=0 state=%u fault=%u\n",
+                   static_cast<long long>(acquisition_ms),
+                   respmon::scenario_name(reading.scenario),
+                   static_cast<unsigned int>(monitor.state()),
+                   static_cast<unsigned int>(monitor.fault()));
+        }
         // Absolute deadlines avoid drift; skip missed periods without bursts.
         next_sample_ms += respmon::config::sample_period_ms;
         const auto now_ms = k_uptime_get();

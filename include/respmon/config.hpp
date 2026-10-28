@@ -9,4 +9,5 @@ inline constexpr std::size_t filter_window_size = 4;
 inline constexpr std::uint32_t waveform_steps = 10;
 inline constexpr std::int32_t base_pressure_pa = 100;
 inline constexpr std::int32_t base_airflow_ml_per_min = 40;
+inline constexpr std::uint32_t samples_per_scenario = 8;
 } // namespace respmon::config
