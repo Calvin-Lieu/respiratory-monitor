@@ -16,6 +16,7 @@ its values and behavior do not define clinical thresholds.
 - `src/pipeline.cpp`, `include/respmon/pipeline*.hpp`: Zephyr threads, fixed queues,
   reporting snapshots, counters and scheduling configuration.
 - `tests/`: standalone host tests of the RTOS-independent domain.
+- `tests/ztest/`: Zephyr ztest application for the same domain logic.
 
 ## Data and behavior
 
@@ -293,6 +294,30 @@ The Zephyr source checkout must remain unchanged.
 Toolchain capability caches default to the ignored `.cache/zephyr` directory.
 The optional external compiler cache is disabled by default to keep generated
 files in the repository. Both settings can be overridden through CMake.
+
+## Zephyr ztest on QEMU
+
+The standalone ztest application has its own `CMakeLists.txt`, `prj.conf`, and
+Twister `tests.yaml`. It exercises the ring buffer, filter, monitor state machine,
+and sensor-health checks without running the application pipeline. The selected
+board is `qemu_cortex_m3`; values in the tests are simulated educational data.
+
+From the repository root:
+
+```sh
+source ~/zephyrproject/.venv312/bin/activate
+mkdir -p .cache/twister-parsetab
+export PARSETAB_DIR="$PWD/.cache/twister-parsetab"
+export PYTHONDONTWRITEBYTECODE=1
+export CCACHE_DIR="$PWD/.cache/ccache"
+../zephyr/scripts/twister -T tests/ztest -p qemu_cortex_m3 --outdir build-twister --inline-logs
+```
+
+The cache settings keep generated parser and compiler files inside the repository.
+Twister writes its test results, including `twister.json` and XML reports, under
+the ignored `build-twister/` directory. Its summary distinguishes executed tests
+from configurations that were only built. Exit with a nonzero status indicates a
+test, build, or runner failure.
 
 ## Host tests
 
