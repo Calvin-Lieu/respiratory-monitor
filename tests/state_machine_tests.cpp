@@ -57,6 +57,28 @@ int main()
     CHECK(result.state == MonitorState::MONITORING && result.transitioned);
     CHECK(result.fault_reason == FaultReason::none && result.reason_changed);
 
+    // A lost sample interrupts entry and recovery streaks without clearing state.
+    monitor.update(warning);
+    monitor.update(warning);
+    monitor.interrupt_streaks();
+    CHECK(!monitor.update(warning).transitioned);
+    CHECK(!monitor.update(warning).transitioned);
+    CHECK(monitor.update(warning).state == MonitorState::WARNING);
+    monitor.update(critical);
+    monitor.update(critical);
+    monitor.interrupt_streaks();
+    CHECK(!monitor.update(critical).transitioned);
+    CHECK(!monitor.update(critical).transitioned);
+    CHECK(monitor.update(critical).state == MonitorState::FAULT);
+    monitor.update(normal);
+    monitor.update(normal);
+    monitor.update(normal);
+    monitor.interrupt_streaks();
+    CHECK(monitor.state() == MonitorState::FAULT);
+    CHECK(monitor.fault() == FaultReason::pressure_threshold);
+    for (int i = 0; i < 3; ++i) { CHECK(!monitor.update(normal).transitioned); }
+    CHECK(monitor.update(normal).state == MonitorState::MONITORING);
+
     // Both channels: just below each threshold stays normal; equality triggers.
     monitor.reset();
     for (int i = 0; i < 4; ++i) { monitor.update({179, 69, 0, true}); }

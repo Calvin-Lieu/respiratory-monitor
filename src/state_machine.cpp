@@ -89,6 +89,11 @@ void StateMachine::reset() noexcept
 {
     state_ = MonitorState::INITIALISING;
     fault_ = FaultReason::none;
+    interrupt_streaks();
+}
+
+void StateMachine::interrupt_streaks() noexcept
+{
     abnormal_count_ = 0;
     fault_count_ = 0;
     normal_count_ = 0;

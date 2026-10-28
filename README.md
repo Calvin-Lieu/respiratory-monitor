@@ -11,7 +11,9 @@ its values and behavior do not define clinical thresholds.
 - `include/respmon/filter.hpp`, `src/filter.cpp`: moving average filter.
 - `include/respmon/sensor_simulator.hpp`, `src/sensor_simulator.cpp`: bounded ramps.
 - `include/respmon/state_machine.hpp`, `src/state_machine.cpp`: debounced monitoring states.
-- `src/main.cpp`: Zephyr clock, scheduling and console output.
+- `src/main.cpp`: startup banner and pipeline launch.
+- `src/pipeline.cpp`, `include/respmon/pipeline*.hpp`: Zephyr threads, fixed queues,
+  reporting snapshots, counters and scheduling configuration.
 - `tests/`: standalone host tests of the RTOS-independent domain.
 
 ## Data and behavior
@@ -41,16 +43,82 @@ Compile-time window bounds ensure 64-bit sums can hold even extreme 32-bit
 inputs. Both pressure and airflow use the same window.
 
 The independent state machine consumes filtered samples, not simulator labels.
-See the transition rules below. Frozen-value detection, configurable elapsed-time
-timeout detection, respiratory metrics, execution-health counters and separate
-telemetry remain future work. Missing acquisitions clear filter history and
-supply explicit timeout events; no placeholder enters the filter.
+See the transition rules below. Frozen-value detection and respiratory metrics
+remain future work. Monitoring waits for queued samples with a bounded timeout;
+missing acquisitions never insert placeholders into the sample queue.
 
 Runtime domain code uses fixed storage, bounded execution, no dynamic allocation,
 exceptions or RTTI. Containers and domain objects have a single owner and are
-not thread-safe. The main loop samples every 500 ms against absolute deadlines,
-skipping missed periods; console output remains synchronous in this foundation.
-No timing or clinical performance is claimed.
+not thread-safe. Domain objects are owned by their respective pipeline threads.
+Only the reporter prints after startup. No timing or clinical performance is claimed.
+
+## Zephyr threaded pipeline
+
+```text
+acquisition (simulator owner) -- SensorSample queue [4] --> monitoring
+          |                                            (filter + state owner)
+          +----------- diagnostic snapshots -----------------+
+                                    |                        |
+                                    v                        v
+                               report queue [16] --> reporting --> console
+```
+
+All queues and thread objects/stacks are statically allocated. `SensorSample`
+and diagnostic records are checked for trivial byte-copyability at compile time
+using the GCC/Clang intrinsic supported by Zephyr's minimal C++ library. Messages
+contain values, not pointers to producer-owned mutable data.
+
+| Thread | Preemptible priority | Requested stack bytes | Behavior |
+|---|---|---|---|
+| acquisition | 2 | 1024 | Read every 500 ms using absolute `k_sleep` deadlines |
+| monitoring | 3 | 2048 | Receive, filter, evaluate; no console calls |
+| reporting | 5 | 2048 | Consume reports, log events and summaries |
+| main | default (0) | 1024 | Start threads once and return |
+
+Lower numbers take priority. Stack sizes are configured reservations, not measured
+high-water marks. Stack sentinels and Zephyr assertions are enabled. Acquisition
+skips missed periods instead of bursting catch-up samples. It never waits for
+queue capacity: `k_msgq_put(..., K_NO_WAIT)` rejects the newest sample when the
+four-slot sample queue is full, preserving the FIFO backlog and incrementing its
+owned `dropped` counter. Invalid but present samples are enqueued normally.
+
+Monitoring uses a 750 ms receive timeout after each sample (500 ms plus scheduling
+slack). After the first timeout, it waits 500 ms per overdue event. Each timeout
+clears the filter and advances the existing fault debounce policy. Thus three
+consecutive timeouts are needed for a timeout FAULT; exact fault time depends on
+kernel tick rounding and scheduling. A sequence gap also clears filter history
+and breaks consecutive-sample streaks without clearing any latched fault. Gaps
+include both simulator omissions and queue drops; only acquisition's `dropped`
+counter measures queue overflow. FIFO backlogs are processed, not purged.
+
+Acquisition owns attempts/enqueued/dropped/missing counters. Monitoring owns
+processed/timeouts/missing-sequence counters. Reporting owns its snapshot copies.
+No application counters or domain objects are shared between threads: each owner
+publishes a value snapshot through the report queue using `K_NO_WAIT`. If that
+queue fills, the new report is discarded and its producer increments a separate
+report-loss counter. Subsequent successful snapshots include cumulative losses;
+state events can be lost under sustained reporting overload, but sample processing
+continues. Summaries expose acquisition/monitoring report losses as `report_drops`.
+Counters are unsigned 64-bit values (wrap modulo 2^64). Snapshot counts may lag
+and do not constitute an atomic cross-thread measurement.
+
+Only the reporter writes runtime logs: thread starts, queue drops, timeout starts,
+sequence gaps, state/reason changes and two-second summaries. Its potentially
+slow console cannot block acquisition or monitoring. `acq_scenario` refers to the
+latest acquisition snapshot; `READING` timestamps/sequences refer to the latest
+processed sample and can differ during backlog or missing input.
+
+A test-only build stalls monitoring once for 3000 ms to force sample queue overflow:
+
+```sh
+west build -p always -d build-pipeline-stress -b qemu_cortex_m3 . -- -DRESPMON_PIPELINE_STRESS_TEST=ON
+west build -d build-pipeline-stress -t run
+```
+
+The test starts with `TEST queue_overflow`, logs `DROP acquisition ... policy=drop_newest`,
+then processes the retained FIFO samples and records a sequence gap when it catches
+up. The default build never intentionally stalls monitoring. Validate captured
+logs using `python3 tests/check_pipeline_log.py <log>` (normal) or append `--stress`.
 
 ## Monitoring states and transitions
 
@@ -67,8 +135,10 @@ only; pressure is integer Pa and airflow is integer mL/min.
 | Consecutive fault-level events for FAULT | 3 |
 | Consecutive normal samples for initialisation/recovery | 4 |
 
-Each `update()` or `on_timeout()` is exactly one acquisition event. Callers must
-supply each acquisition once; sequence freshness/deduplication is not implemented.
+Each `update()` consumes one delivered sample; `on_timeout()` represents one
+overdue acquisition period. A detected sequence gap calls `interrupt_streaks()`
+to clear entry/recovery counters while retaining state and any active fault.
+Callers must supply each event once; duplicate rejection is not implemented.
 An invalid sample is fault-level regardless of numeric fields. A timeout is also
 fault-level. For valid input, either fault threshold is fault-level; otherwise
 either warning threshold is warning-level. Normal means valid and strictly below
@@ -96,8 +166,8 @@ Counters saturate at their configured limits instead of overflowing.
 `StateMachineResult` returns `state`, `transitioned`, `fault_reason`, and
 `reason_changed`. `transitioned` means only a change of state. The application
 prints a `STATE` event when state or active reason changes, including previous
-and current state and a named reason. Per-sample `SIM` telemetry contains readings
-and validity without repeating the monitoring state.
+and current state and a named reason. The lower-priority reporter prints state
+events and periodic summaries; monitoring never calls `printk`.
 
 Reasons are `none`, `pressure_threshold`, `airflow_threshold`, `invalid_sample`,
 `sensor_timeout`, and `invalid_configuration`. Before fault confirmation there
@@ -147,9 +217,10 @@ input sequence and timestamp, including invalid input metadata. Empty filter
 output has zero metadata and `valid=false`.
 
 `SimulatedReading` carries scenario metadata separately from the measurement.
-When `available=false`, its default sample is not a measurement and must be
-ignored. The application logs acquisition time and availability instead. Invalid
-samples log `filtered_valid=0`; their zero filtered values are not measurements.
+When `available=false`, its default sample is ignored and nothing is enqueued.
+Acquisition counts this as `missing`, distinct from queue overflow `dropped`.
+Invalid delivered samples have `filtered_valid=0`; their zero filtered values
+are not measurements.
 
 ## Build and run
 
@@ -161,12 +232,14 @@ west build -p always -b qemu_cortex_m3 .
 west build -t run
 ```
 
-Expected startup includes `Respiratory monitor starting (simulated educational data)`
-followed by `SIM` records showing the active scenario, sequence number, validity,
-raw and filtered pressure and airflow with explicit units. Separate `STATE`
-events report named states and reasons only when they change. Missing acquisitions log `available=0` without measurement values. For example, the second input is
-101 Pa and 41 mL/min; its two-sample averages are 100 Pa and 40 mL/min due to
-integer truncation. Later samples show full-window smoothing and overwrite.
+Expected startup includes `Respiratory monitor starting (simulated educational data)`,
+queue configuration and all three thread startup records. `STATE` events show
+transitions and reason changes. `SUMMARY` lines show counters and current state
+every two seconds; `READING` lines show the latest processed raw/filtered values,
+sequence, source timestamp and validity. These are periodic snapshots, not a log
+of every sample. The second input's 101 Pa / 41 mL/min averages to 100 Pa / 40 mL/min
+with integer truncation. `latest_event_sample=0` marks a summary whose latest
+monitoring event was a timeout; the displayed reading is retained history.
 Exit QEMU with Ctrl-A then X. Build outputs are ignored; do not commit them.
 The Zephyr source checkout must remain unchanged.
 Toolchain capability caches default to the ignored `.cache/zephyr` directory.

@@ -9,8 +9,13 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(respiratory_monitor)
 
 target_include_directories(app PRIVATE include)
+option(RESPMON_PIPELINE_STRESS_TEST "Delay monitoring startup to test queue overflow in QEMU" OFF)
+if(RESPMON_PIPELINE_STRESS_TEST)
+    target_compile_definitions(app PRIVATE RESPMON_PIPELINE_STRESS_TEST=1)
+endif()
 target_sources(app PRIVATE
     src/main.cpp
+    src/pipeline.cpp
     src/filter.cpp
     src/sensor_simulator.cpp
     src/state_machine.cpp

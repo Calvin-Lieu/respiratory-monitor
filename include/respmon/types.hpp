@@ -11,6 +11,10 @@ struct SensorSample {
     // Acquisition-attempt counter, modulo 2^32; missing attempts leave gaps.
     std::uint32_t sequence{0};
 };
+// GCC/Clang intrinsic works with Zephyr's minimal C++ library, which does not
+// provide <type_traits>. k_msgq copies object bytes, never pointers to storage.
+static_assert(__is_trivially_copyable(SensorSample),
+              "SensorSample must be safe for byte-copying through k_msgq");
 // Filtered values retain the input units. Ignore values when valid is false.
 struct ProcessedSample {
     std::int32_t pressure_pa{0};
