@@ -27,6 +27,19 @@ averages up to four valid samples, including partial startup windows, using
 64-bit sums and integer division toward zero. Invalid input clears history and
 produces invalid output with the input timestamp.
 
+`RingBuffer<T, N>` provides `push`, `size`, compile-time `capacity`, `empty`,
+`full`, `clear`, and checked `get(index, output)` access. A push into a full
+buffer overwrites exactly the oldest entry and keeps size at N. Index zero is
+the oldest retained sample; invalid indices return false and leave output
+unchanged. Capacity must be positive. Storage is inline; element types must
+support default construction and copying without allocation or exceptions.
+
+`Filter::average()` reads the retained window without adding a sample. When
+empty (including after reset), it returns zeros and `valid=false` without
+division. Otherwise its timestamp is that of the newest retained sample.
+Compile-time window bounds ensure 64-bit sums can hold even extreme 32-bit
+inputs. Both pressure and airflow use the same window.
+
 The state machine starts in `initializing` (0), enters `monitoring` (1) on valid
 processed input, and enters `sensor_fault` (2) on invalid input. Fault reasons
 are `none` (0) and `invalid_sample` (1). Recovery is immediate at this stage.
@@ -50,7 +63,10 @@ west build -t run
 ```
 
 Expected startup includes `Respiratory monitor starting (simulated educational data)`
-followed by `SIM` records with explicit units and numeric state/fault codes.
+followed by `SIM` records showing raw and filtered pressure and airflow with
+explicit units and numeric state/fault codes. For example, the second input is
+101 Pa and 41 mL/min; its two-sample averages are 100 Pa and 40 mL/min due to
+integer truncation. Later samples show full-window smoothing and overwrite.
 Exit QEMU with Ctrl-A then X. Build outputs are ignored; do not commit them.
 The Zephyr source checkout must remain unchanged.
 Toolchain capability caches default to the ignored `.cache/zephyr` directory.
@@ -67,8 +83,9 @@ cmake --build build-host
 ctest --test-dir build-host --output-on-failure
 ```
 
-Tests cover ring-buffer overwrite and bounds, simulator wrap/reset, partial and
-full filter windows, negative rounding, invalid-input reset, extreme integer
+Tests cover ring-buffer capacity/state, repeated overwrite, checked bounds,
+capacity one, simulator wrap/reset, empty/partial/full filter windows, comparison
+against independent sums over many wraps, negative rounding, invalid-input reset, extreme integer
 inputs, and state fault/recovery/reset transitions. Checks remain active in
 release builds. Build and test every milestone before creating a local commit;
 do not push to a remote.

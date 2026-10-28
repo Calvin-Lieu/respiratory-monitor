@@ -8,20 +8,33 @@ ProcessedSample Filter::process(const SensorSample& sample) noexcept
         return {0, 0, sample.timestamp_ms, false};
     }
     history_.push(sample);
+    return average();
+}
+
+ProcessedSample Filter::average() const noexcept
+{
+    if (history_.empty()) {
+        return {};
+    }
     std::int64_t pressure_sum = 0;
     std::int64_t airflow_sum = 0;
-    // Bound sums of arbitrary int32_t inputs within int64_t.
-    static_assert(config::filter_window_size <= 2147483647U);
+    // Even Capacity copies of INT32_MIN fit in int64_t with this bound.
+    // The average remains within the int32_t input range before narrowing.
+    static_assert(config::filter_window_size > 0, "Filter window must be nonempty");
+    static_assert(config::filter_window_size <= 2147483647U,
+                  "Filter window exceeds safe int64_t accumulator bound");
+    std::int64_t newest_timestamp_ms = 0;
     for (std::size_t i = 0; i < history_.size(); ++i) {
         SensorSample previous{};
         history_.get(i, previous);
         pressure_sum += previous.pressure_pa;
         airflow_sum += previous.airflow_ml_per_min;
+        newest_timestamp_ms = previous.timestamp_ms;
     }
     const auto count = static_cast<std::int64_t>(history_.size());
     return {static_cast<std::int32_t>(pressure_sum / count),
             static_cast<std::int32_t>(airflow_sum / count),
-            sample.timestamp_ms, true};
+            newest_timestamp_ms, true};
 }
 void Filter::reset() noexcept { history_.clear(); }
 } // namespace respmon
