@@ -5,6 +5,7 @@
 #include "respmon/pipeline.hpp"
 #include "respmon/pipeline_config.hpp"
 #include "respmon/sensor_simulator.hpp"
+#include "respmon/sensor_health.hpp"
 #include "respmon/state_machine.hpp"
 
 namespace respmon {
@@ -19,10 +20,13 @@ struct AcquisitionStats {
     std::uint64_t dropped{0};
     std::uint64_t missing{0};
     std::uint64_t report_drops{0};
+    bool queue_full{false};
     SensorScenario scenario{SensorScenario::normal};
 };
 struct MonitoringStats {
     std::uint64_t processed{0};
+    std::uint64_t valid{0};
+    std::uint64_t invalid{0};
     std::uint64_t timeouts{0};
     std::uint64_t sequence_gaps{0};
     std::uint64_t report_drops{0};
@@ -39,6 +43,8 @@ struct Report {
     ProcessedSample filtered{};
     MonitorState previous_state{MonitorState::INITIALISING};
     StateMachineResult result{};
+    FaultReason health_reason{FaultReason::none};
+    bool health_changed{false};
 };
 static_assert(__is_trivially_copyable(Report), "Reports must be byte-copyable");
 
@@ -67,6 +73,7 @@ void acquisition_entry(void*, void*, void*)
         const auto reading = sensor.read(now);
         ++stats.attempts;
         stats.scenario = reading.scenario;
+        stats.queue_full = false;
         if (!reading.available) {
             ++stats.missing;
         } else if (k_msgq_put(&sample_queue, &reading.sample, K_NO_WAIT) == 0) {
@@ -74,6 +81,7 @@ void acquisition_entry(void*, void*, void*)
         } else {
             // Drop newest: retain already queued samples, never wait on monitoring.
             ++stats.dropped;
+            stats.queue_full = true;
         }
         report.event_ms = now;
         report.acquisition = stats;
@@ -91,6 +99,7 @@ void acquisition_entry(void*, void*, void*)
 void monitoring_entry(void*, void*, void*)
 {
     Filter filter;
+    SensorHealth health;
     StateMachine monitor;
     MonitoringStats stats;
     Report report;
@@ -98,8 +107,7 @@ void monitoring_entry(void*, void*, void*)
     report.startup = true;
     publish(report, stats.report_drops);
     report.startup = false;
-    bool have_previous = false;
-    std::uint32_t previous_sequence = 0;
+    FaultReason previous_health = FaultReason::none;
     auto wait_ms = settings::first_sample_timeout_ms;
 #ifdef RESPMON_PIPELINE_STRESS_TEST
     // Test-only startup stall: four slots fill, then acquisition must drop
@@ -110,37 +118,37 @@ void monitoring_entry(void*, void*, void*)
         SensorSample raw;
         const int received = k_msgq_get(&sample_queue, &raw, K_MSEC(wait_ms));
         report.previous_state = monitor.state();
+        report.event_ms = k_uptime_get();
         if (received == 0) {
-            if (have_previous) {
-                // Unsigned subtraction handles sequence wrap modulo 2^32.
-                const auto gap = static_cast<std::uint32_t>(raw.sequence - previous_sequence - 1U);
-                if (gap != 0) {
-                    stats.sequence_gaps += gap;
-                    filter.reset();
-                    monitor.interrupt_streaks();
-                }
-            } else {
-                // Sequence starts at zero, so account for loss before first receive.
-                stats.sequence_gaps += raw.sequence;
-            }
-            previous_sequence = raw.sequence;
-            have_previous = true;
             ++stats.processed;
+            const auto checked = health.inspect(raw, report.event_ms);
+            stats.sequence_gaps += checked.missing_sequences;
             report.raw = raw;
-            report.filtered = filter.process(raw);
-            report.result = monitor.update(report.filtered);
-            report.event_ms = raw.timestamp_ms;
+            report.health_reason = checked.reason;
+            if (checked.accepted()) {
+                ++stats.valid;
+                report.filtered = filter.process(raw);
+                report.result = monitor.update(report.filtered);
+            } else {
+                ++stats.invalid;
+                filter.reset();
+                report.filtered = {0, 0, raw.timestamp_ms, false, raw.sequence};
+                report.result = monitor.on_sensor_fault(checked.reason);
+            }
             report.has_sample = true;
             wait_ms = settings::first_sample_timeout_ms;
         } else {
             ++stats.timeouts;
             filter.reset();
+            health.on_timeout();
             report.result = monitor.on_timeout();
-            report.event_ms = k_uptime_get();
+            report.health_reason = FaultReason::sensor_timeout;
             report.has_sample = false;
             // After the first overdue sample, emit one timeout per expected period.
             wait_ms = config::sample_period_ms;
         }
+        report.health_changed = report.health_reason != previous_health;
+        previous_health = report.health_reason;
         report.monitoring = stats;
         publish(report, stats.report_drops);
     }
@@ -151,7 +159,7 @@ void print_summary(const AcquisitionStats& acquisition, const Report& latest,
                    const ProcessedSample& filtered)
 {
     printk("SUMMARY time=%lld ms acq_scenario=%s attempts=%llu enqueued=%llu "
-           "dropped=%llu missing=%llu processed=%llu timeouts=%llu gaps=%llu "
+           "dropped=%llu missing=%llu total=%llu valid=%llu invalid=%llu timeouts=%llu gaps=%llu "
            "report_drops=%llu/%llu state=%s reason=%s\n",
            static_cast<long long>(k_uptime_get()), scenario_name(acquisition.scenario),
            static_cast<unsigned long long>(acquisition.attempts),
@@ -159,6 +167,8 @@ void print_summary(const AcquisitionStats& acquisition, const Report& latest,
            static_cast<unsigned long long>(acquisition.dropped),
            static_cast<unsigned long long>(acquisition.missing),
            static_cast<unsigned long long>(latest.monitoring.processed),
+           static_cast<unsigned long long>(latest.monitoring.valid),
+           static_cast<unsigned long long>(latest.monitoring.invalid),
            static_cast<unsigned long long>(latest.monitoring.timeouts),
            static_cast<unsigned long long>(latest.monitoring.sequence_gaps),
            static_cast<unsigned long long>(acquisition.report_drops),
@@ -198,22 +208,16 @@ void reporting_entry(void*, void*, void*)
                        is_acquisition ? settings::acquisition_priority : settings::monitoring_priority,
                        is_acquisition ? settings::acquisition_stack_bytes : settings::monitoring_stack_bytes);
             } else if (report.source == ReportSource::acquisition) {
-                if (report.acquisition.dropped != acquisition.dropped) {
+                if (report.acquisition.queue_full && !acquisition.queue_full) {
                     printk("DROP acquisition time=%lld ms total=%llu policy=drop_newest\n",
                            static_cast<long long>(report.event_ms),
                            static_cast<unsigned long long>(report.acquisition.dropped));
                 }
                 acquisition = report.acquisition;
             } else {
-                if (!report.has_sample &&
-                    (report.monitoring.timeouts == 1 || latest.has_sample)) {
-                    printk("TIMEOUT monitoring time=%lld ms total=%llu\n",
-                           static_cast<long long>(report.event_ms),
-                           static_cast<unsigned long long>(report.monitoring.timeouts));
-                }
-                if (report.monitoring.sequence_gaps != latest.monitoring.sequence_gaps) {
-                    printk("GAP monitoring seq=%lu total_missing_sequences=%llu\n",
-                           static_cast<unsigned long>(report.raw.sequence),
+                if (report.health_changed) {
+                    printk("HEALTH time=%lld ms reason=%s gaps=%llu\n",
+                           static_cast<long long>(report.event_ms), fault_name(report.health_reason),
                            static_cast<unsigned long long>(report.monitoring.sequence_gaps));
                 }
                 if (report.result.transitioned || report.result.reason_changed) {

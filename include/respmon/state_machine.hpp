@@ -24,6 +24,7 @@ public:
     explicit StateMachine(MonitorConfig config = {}) noexcept : config_(config) {}
     StateMachineResult update(const ProcessedSample& sample) noexcept;
     StateMachineResult on_timeout() noexcept;
+    StateMachineResult on_sensor_fault(FaultReason reason) noexcept;
     // Missing sequence numbers break consecutiveness but retain any active fault.
     void interrupt_streaks() noexcept;
     void reset() noexcept;

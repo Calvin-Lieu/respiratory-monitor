@@ -32,4 +32,22 @@ struct MonitorConfig {
     }
 };
 static_assert(MonitorConfig{}.valid(), "Default monitor configuration must be valid");
+
+// Demonstration input envelope and integrity limits, not clinical thresholds.
+struct SensorHealthConfig {
+    std::int32_t min_pressure_pa{0};
+    std::int32_t max_pressure_pa{500};
+    std::int32_t min_airflow_ml_per_min{0};
+    std::int32_t max_airflow_ml_per_min{200};
+    std::int64_t max_age_ms{1000};
+    std::uint32_t max_identical_samples{3};
+    constexpr bool valid() const noexcept
+    {
+        return min_pressure_pa <= max_pressure_pa &&
+               min_airflow_ml_per_min <= max_airflow_ml_per_min &&
+               max_age_ms >= 0 && max_identical_samples > 0 &&
+               max_identical_samples < UINT32_MAX;
+    }
+};
+static_assert(SensorHealthConfig{}.valid(), "Default sensor health config must be valid");
 } // namespace respmon

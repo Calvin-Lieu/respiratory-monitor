@@ -5,7 +5,8 @@ namespace respmon {
 namespace {
 constexpr SensorScenario schedule[] = {
     SensorScenario::normal, SensorScenario::elevated, SensorScenario::critical,
-    SensorScenario::invalid, SensorScenario::out_of_range, SensorScenario::frozen,
+    SensorScenario::invalid, SensorScenario::out_of_range, SensorScenario::stale_timestamp,
+    SensorScenario::sequence_gap, SensorScenario::frozen,
     SensorScenario::timeout, SensorScenario::recovery
 };
 constexpr std::uint32_t scenario_count = sizeof(schedule) / sizeof(schedule[0]);
@@ -23,6 +24,8 @@ const char* scenario_name(SensorScenario scenario) noexcept
     case SensorScenario::critical: return "critical";
     case SensorScenario::invalid: return "invalid";
     case SensorScenario::out_of_range: return "out_of_range";
+    case SensorScenario::stale_timestamp: return "stale_timestamp";
+    case SensorScenario::sequence_gap: return "sequence_gap";
     case SensorScenario::frozen: return "frozen";
     case SensorScenario::timeout: return "timeout";
     case SensorScenario::recovery: return "recovery";
@@ -34,6 +37,7 @@ SimulatedReading SensorSimulator::read(std::int64_t timestamp_ms) noexcept
 {
     const auto scenario = schedule[step_ / config::samples_per_scenario];
     const auto phase = step_ % config::samples_per_scenario;
+    if (scenario == SensorScenario::sequence_gap) { ++sequence_; }
     const auto sequence = sequence_++;
     step_ = (step_ + 1U) % cycle_length;
     if (scenario == SensorScenario::timeout) {
@@ -59,7 +63,10 @@ SimulatedReading SensorSimulator::read(std::int64_t timestamp_ms) noexcept
     case SensorScenario::out_of_range:
         sample.pressure_pa = -1000;
         sample.airflow_ml_per_min = 1000000;
-        sample.valid = false; // Outside the simulator's documented output envelope.
+        // Deliberately claim valid to exercise independent range validation.
+        break;
+    case SensorScenario::stale_timestamp:
+        sample.timestamp_ms = timestamp_ms >= 2000 ? timestamp_ms - 2000 : 0;
         break;
     case SensorScenario::frozen:
         sample.pressure_pa = config::base_pressure_pa;

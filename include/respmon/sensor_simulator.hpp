@@ -3,7 +3,8 @@
 
 namespace respmon {
 enum class SensorScenario : std::uint8_t {
-    normal, elevated, critical, invalid, out_of_range, frozen, timeout, recovery
+    normal, elevated, critical, invalid, out_of_range, stale_timestamp,
+    sequence_gap, frozen, timeout, recovery
 };
 
 const char* scenario_name(SensorScenario scenario) noexcept;
@@ -15,7 +16,7 @@ struct SimulatedReading {
 };
 
 // Each read advances one acquisition attempt, including missing samples.
-// Eight fixed-length scenarios repeat forever. Caller supplies monotonic time;
+// Fixed-length scenarios repeat forever. Caller supplies monotonic time;
 // no RTOS, wall-clock, random generator, allocation or monitoring policy here.
 class SensorSimulator {
 public:

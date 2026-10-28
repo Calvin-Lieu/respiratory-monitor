@@ -11,6 +11,7 @@ its values and behavior do not define clinical thresholds.
 - `include/respmon/filter.hpp`, `src/filter.cpp`: moving average filter.
 - `include/respmon/sensor_simulator.hpp`, `src/sensor_simulator.cpp`: bounded ramps.
 - `include/respmon/state_machine.hpp`, `src/state_machine.cpp`: debounced monitoring states.
+- `include/respmon/sensor_health.hpp`, `src/sensor_health.cpp`: pre-filter integrity checks.
 - `src/main.cpp`: startup banner and pipeline launch.
 - `src/pipeline.cpp`, `include/respmon/pipeline*.hpp`: Zephyr threads, fixed queues,
   reporting snapshots, counters and scheduling configuration.
@@ -43,8 +44,7 @@ Compile-time window bounds ensure 64-bit sums can hold even extreme 32-bit
 inputs. Both pressure and airflow use the same window.
 
 The independent state machine consumes filtered samples, not simulator labels.
-See the transition rules below. Frozen-value detection and respiratory metrics
-remain future work. Monitoring waits for queued samples with a bounded timeout;
+See the transition rules below. Respiratory metrics remain future work. Monitoring waits for queued samples with a bounded timeout;
 missing acquisitions never insert placeholders into the sample queue.
 
 Runtime domain code uses fixed storage, bounded execution, no dynamic allocation,
@@ -84,15 +84,20 @@ owned `dropped` counter. Invalid but present samples are enqueued normally.
 
 Monitoring uses a 750 ms receive timeout after each sample (500 ms plus scheduling
 slack). After the first timeout, it waits 500 ms per overdue event. Each timeout
-clears the filter and advances the existing fault debounce policy. Thus three
-consecutive timeouts are needed for a timeout FAULT; exact fault time depends on
-kernel tick rounding and scheduling. A sequence gap also clears filter history
-and breaks consecutive-sample streaks without clearing any latched fault. Gaps
-include both simulator omissions and queue drops; only acquisition's `dropped`
-counter measures queue overflow. FIFO backlogs are processed, not purged.
+clears the filter, resets the frozen run, and advances fault debounce. Three
+consecutive fault-level events are needed for a timeout FAULT; scheduling and
+tick rounding affect the exact time. Monitoring validates each queued sample
+against `k_uptime_get()` before filtering, so a backed-up but present sample can
+be rejected as stale. FIFO backlogs are processed, not purged.
 
-Acquisition owns attempts/enqueued/dropped/missing counters. Monitoring owns
-processed/timeouts/missing-sequence counters. Reporting owns its snapshot copies.
+Acquisition owns `attempts`, `enqueued`, `dropped` (queue-full) and `missing`
+(simulator absence). Monitoring owns `total`, `valid`, `invalid`, `timeouts` and
+`gaps`: `total` counts delivered samples, `valid` counts those accepted by every
+integrity check, and `invalid` counts all rejected samples, including stale,
+sequence and frozen faults. Therefore `total = valid + invalid` modulo 2^64.
+Timeouts do not count as delivered samples. Sequence gaps include injected skips,
+simulator omissions and queue drops, so `gaps` and `dropped` are distinct.
+Reporting owns its snapshot copies.
 No application counters or domain objects are shared between threads: each owner
 publishes a value snapshot through the report queue using `K_NO_WAIT`. If that
 queue fills, the new report is discarded and its producer increments a separate
@@ -102,8 +107,9 @@ continues. Summaries expose acquisition/monitoring report losses as `report_drop
 Counters are unsigned 64-bit values (wrap modulo 2^64). Snapshot counts may lag
 and do not constitute an atomic cross-thread measurement.
 
-Only the reporter writes runtime logs: thread starts, queue drops, timeout starts,
-sequence gaps, state/reason changes and two-second summaries. Its potentially
+Only the reporter writes runtime logs: thread starts, entry into queue-full, health
+reason changes, state/reason changes and two-second summaries. Persistent faults
+do not produce a log line on every sample. Its potentially
 slow console cannot block acquisition or monitoring. `acq_scenario` refers to the
 latest acquisition snapshot; `READING` timestamps/sequences refer to the latest
 processed sample and can differ during backlog or missing input.
@@ -120,6 +126,46 @@ then processes the retained FIFO samples and records a sequence gap when it catc
 up. The default build never intentionally stalls monitoring. Validate captured
 logs using `python3 tests/check_pipeline_log.py <log>` (normal) or append `--stress`.
 
+## Pre-filter sensor health
+
+`SensorHealth` is RTOS-independent and receives a sample and the caller's current
+monotonic uptime. `SensorHealthConfig` defaults to the synthetic inclusive range
+0–500 Pa and 0–200 mL/min, maximum age 1000 ms, and at most three consecutive
+identical pressure-and-airflow pairs. These values exercise the simulator; they
+are not clinical limits. Configuration rejects inverted ranges, negative maximum
+age, zero identical limit, and a limit too large for its bounded counter.
+
+Priority for simultaneous sample faults is: invalid configuration; stale timestamp
+(negative, future, older than maximum age, or not strictly newer than the previous
+fresh timestamp); sequence order/gap; invalid source flag; out-of-range numeric
+values; frozen sensor. A timeout is a separate absence event; filtered pressure
+and then airflow thresholds apply only after health acceptance. Bad configuration
+faults immediately; other faults follow the state machine's existing debounce.
+When a sequence gap and another higher-priority fault coincide, the gap count is
+still recorded. The active reason is the highest-priority fault for that event;
+when multiple consecutive fault events have different causes, the latest event
+becomes the latched reason after the fault streak qualifies.
+
+The uint32 sequence uses modulo arithmetic: distance 1 is consecutive, 2 through
+2^31−1 is a forward gap, and zero or 2^31 through 2^32−1 is duplicate/backward or
+ambiguous and rejected without changing the baseline. This assumes fewer than
+2^31 consecutive missing sequence numbers; reset or source replacement requires
+explicitly resetting the health checker. Before the first sample the sequence is
+assumed to start at zero. A forward gap advances the baseline but rejects that
+sample, clears filtering, and counts as a fault-level event. The next fresh,
+consecutive sample can begin recovery. Every fresh timestamp advances its baseline
+even if the payload is rejected; stale timestamps do not. A bad payload, timeout,
+or sequence/timestamp error breaks the identical-value streak. The fourth matching
+sample and subsequent identical samples are rejected until values change. Recovery
+requires four consecutive accepted, normal filtered samples and retains the fault
+until the fourth. Filters restart empty on every rejected sample or timeout.
+
+Zephyr uptime is signed 64-bit milliseconds; nonnegative uptime has roughly
+292 million years of representable range. The timestamp check verifies bounds
+before subtraction. Application deadlines assume uptime does not reach that
+limit during a run. Counters use unsigned 64-bit arithmetic and wrap modulo 2^64;
+state and frozen streak counters saturate at their configured bounds.
+
 ## Monitoring states and transitions
 
 `MonitorConfig` is a copied configuration object supplied to `StateMachine`.
@@ -135,10 +181,10 @@ only; pressure is integer Pa and airflow is integer mL/min.
 | Consecutive fault-level events for FAULT | 3 |
 | Consecutive normal samples for initialisation/recovery | 4 |
 
-Each `update()` consumes one delivered sample; `on_timeout()` represents one
-overdue acquisition period. A detected sequence gap calls `interrupt_streaks()`
-to clear entry/recovery counters while retaining state and any active fault.
-Callers must supply each event once; duplicate rejection is not implemented.
+Each `update()` consumes one accepted filtered sample. A rejected sample becomes
+`on_sensor_fault(reason)` and an overdue period becomes `on_timeout()`; both are
+fault-level events and clear the filter. Callers must supply each event once.
+The health checker rejects duplicate and out-of-order sequence numbers.
 An invalid sample is fault-level regardless of numeric fields. A timeout is also
 fault-level. For valid input, either fault threshold is fault-level; otherwise
 either warning threshold is warning-level. Normal means valid and strictly below
@@ -170,7 +216,8 @@ and current state and a named reason. The lower-priority reporter prints state
 events and periodic summaries; monitoring never calls `printk`.
 
 Reasons are `none`, `pressure_threshold`, `airflow_threshold`, `invalid_sample`,
-`sensor_timeout`, and `invalid_configuration`. Before fault confirmation there
+`sensor_timeout`, `stale_timestamp`, `sequence_gap`, `sequence_order`,
+`out_of_range`, `frozen_sensor`, and `invalid_configuration`. Before fault confirmation there
 is no active fault reason; WARNING has reason `none`. Invalid configuration
 (warning threshold >= fault threshold or any count < 2) produces an immediate,
 latched FAULT on evaluation, with reason `invalid_configuration`; it cannot
@@ -181,7 +228,7 @@ The default configuration is checked at compile time.
 ## Deterministic scenarios
 
 Every scenario lasts eight acquisition attempts (`config::samples_per_scenario`).
-At the configured 500 ms period, a cycle is nominally 32 seconds of simulated
+At the configured 500 ms period, a cycle is nominally 40 seconds of simulated
 time. QEMU may execute simulated time faster than wall time. Every `read()` call
 advances the schedule even if no measurement is available; supplied timestamps
 and scheduler delays do not change the count-based schedule. No randomness,
@@ -196,31 +243,32 @@ for exercising software. They are not physiological ranges or clinical threshold
 | 8–15 | elevated | 200–207 | 80–84 | Valid ramp |
 | 16–23 | critical | 400–407 | 160–164 | Valid ramp |
 | 24–31 | invalid | 100–107 | 40–44 | Present, validity false |
-| 32–39 | out_of_range | -1000 | 1000000 | Present, validity false |
-| 40–47 | frozen | 100 | 40 | Valid, identical values every attempt |
-| 48–55 | timeout | — | — | No sample available |
-| 56–63 | recovery | 100–107 | 40–44 | Valid ramp; monitor recovers |
+| 32–39 | out_of_range | -1000 | 1000000 | Present, claims valid; rejected by range check |
+| 40–47 | stale_timestamp | 100–107 | 40–44 | Timestamp 2000 ms behind uptime |
+| 48–55 | sequence_gap | 100–107 | 40–44 | Skip one sequence before every reading |
+| 56–63 | frozen | 100 | 40 | Identical values every attempt |
+| 64–71 | timeout | — | — | No sample available |
+| 72–79 | recovery | 100–107 | 40–44 | Ramp; gap on first delivery, then normal recovery |
 
 Normal/elevated/critical/recovery ramps use within-scenario index modulo ten for
 pressure and modulo five for airflow. Frozen means constant measurement values;
-its timestamps and sequence numbers still advance. The synthetic output envelope
-for valid samples is 100–407 Pa and 40–164 mL/min. Out-of-range inputs deliberately
-violate this simulator envelope and carry `valid=false`; this does not implement
-a general-purpose monitor range validator.
+its timestamps and sequence numbers still advance. Out-of-range values deliberately
+violate the configured synthetic envelope while claiming validity, to exercise
+independent validation. The sequence-gap scenario skips one sequence before each
+reading. Missing attempts also consume sequence numbers.
 
-`SensorSample` records the caller timestamp, validity and a uint32 sequence number.
-Sequence starts at zero, advances on every acquisition attempt, and wraps modulo
-2^32. Timeout attempts consume sequence numbers, so recovery begins at sequence
-56 rather than 48. The counter continues across scenario cycles; `reset()`
-restarts both the schedule and sequence. `ProcessedSample` preserves the newest
-input sequence and timestamp, including invalid input metadata. Empty filter
-output has zero metadata and `valid=false`.
+`SensorSample` records timestamp, validity and a uint32 sequence number. Sequences
+start at zero and increment modulo 2^32, including missing attempts and injected
+skips. In the first cycle the last pre-timeout sequence is 71 and recovery begins
+at 80, leaving eight missing sequence numbers. Reset restarts schedule and sequence.
+`ProcessedSample` preserves input timestamp and sequence, including on rejection.
+Empty filter output has zero metadata and `valid=false`.
 
 `SimulatedReading` carries scenario metadata separately from the measurement.
 When `available=false`, its default sample is ignored and nothing is enqueued.
 Acquisition counts this as `missing`, distinct from queue overflow `dropped`.
-Invalid delivered samples have `filtered_valid=0`; their zero filtered values
-are not measurements.
+Rejected delivered samples have `filtered_valid=0`; their zero filtered values
+are not measurements, even if the source validity flag was true.
 
 ## Build and run
 
@@ -263,6 +311,8 @@ empty/partial/full filter windows, comparison
 against independent sums over many wraps, negative rounding, invalid-input reset, extreme integer
 inputs, and complete filtered-pipeline cycles. A separate state-machine suite checks
 threshold equality and channel independence, interrupted streaks, latched faults,
-recovery, reason changes, custom/invalid configuration, and reset. Checks remain active in
+recovery, reason changes, custom/invalid configuration, and reset. Sensor-health
+tests cover timestamp bounds, invalid/range rejection, serial-number wrap/order,
+fault precedence, frozen detection and recovery. Checks remain active in
 release builds. Build and test every milestone before creating a local commit;
 do not push to a remote.

@@ -2,6 +2,7 @@
 #include <limits>
 #include "respmon/filter.hpp"
 #include "respmon/sensor_simulator.hpp"
+#include "respmon/sensor_health.hpp"
 #include "respmon/state_machine.hpp"
 
 #define CHECK(condition) do { if (!(condition)) { \
@@ -48,28 +49,33 @@ int main()
     respmon::SensorSimulator sensor;
     respmon::SensorSimulator replay;
     respmon::Filter scenario_filter;
+    respmon::SensorHealth health;
     respmon::StateMachine scenario_monitor;
     constexpr respmon::SensorScenario expected[] = {
         respmon::SensorScenario::normal, respmon::SensorScenario::elevated,
         respmon::SensorScenario::critical, respmon::SensorScenario::invalid,
-        respmon::SensorScenario::out_of_range, respmon::SensorScenario::frozen,
+        respmon::SensorScenario::out_of_range, respmon::SensorScenario::stale_timestamp,
+        respmon::SensorScenario::sequence_gap, respmon::SensorScenario::frozen,
         respmon::SensorScenario::timeout, respmon::SensorScenario::recovery
     };
     constexpr auto duration = respmon::config::samples_per_scenario;
-    constexpr auto cycle = duration * 8U;
+    constexpr auto cycle = duration * 10U;
+    std::uint32_t expected_sequence = 0;
     for (std::uint32_t i = 0; i < cycle * 3U; ++i) {
-        // Uneven caller times do not alter count-based scenario progression.
         const auto now = static_cast<std::int64_t>(i) * 537;
         const auto reading = sensor.read(now);
         const auto again = replay.read(now);
         const auto phase = i % duration;
         const auto scenario = expected[(i % cycle) / duration];
+        if (scenario == respmon::SensorScenario::sequence_gap) { ++expected_sequence; }
+        const auto sequence = expected_sequence++;
         CHECK(reading.scenario == scenario && again.scenario == scenario);
         CHECK(reading.available == again.available);
         CHECK(reading.available == (scenario != respmon::SensorScenario::timeout));
         CHECK(respmon::scenario_name(scenario)[0] != '\0');
         if (!reading.available) {
             scenario_filter.reset();
+            health.on_timeout();
             scenario_monitor.on_timeout();
             CHECK(!scenario_filter.average().valid);
             if (phase + 1 >= respmon::MonitorConfig{}.fault_samples) {
@@ -79,14 +85,13 @@ int main()
             continue;
         }
         const auto& raw = reading.sample;
-        CHECK(raw.timestamp_ms == now && raw.sequence == i);
+        CHECK(raw.timestamp_ms == (scenario == respmon::SensorScenario::stale_timestamp ? now - 2000 : now));
+        CHECK(raw.sequence == sequence);
         CHECK(raw.pressure_pa == again.sample.pressure_pa);
         CHECK(raw.airflow_ml_per_min == again.sample.airflow_ml_per_min);
         CHECK(raw.timestamp_ms == again.sample.timestamp_ms);
         CHECK(raw.valid == again.sample.valid && raw.sequence == again.sample.sequence);
-        const bool invalid = scenario == respmon::SensorScenario::invalid ||
-                             scenario == respmon::SensorScenario::out_of_range;
-        CHECK(raw.valid == !invalid);
+        CHECK(raw.valid == (scenario != respmon::SensorScenario::invalid));
         const auto ramp = static_cast<std::int32_t>(phase % respmon::config::waveform_steps);
         const auto flow_ramp = static_cast<std::int32_t>(phase % 5U);
         switch (scenario) {
@@ -106,24 +111,33 @@ int main()
             CHECK(raw.pressure_pa == 100 + ramp && raw.airflow_ml_per_min == 40 + flow_ramp);
             break;
         }
-        const auto processed = scenario_filter.process(raw);
-        scenario_monitor.update(processed);
-        CHECK(processed.sequence == i && processed.timestamp_ms == now);
-        CHECK(processed.valid == !invalid);
+        const auto checked = health.inspect(raw, now);
+        auto expected_reason = respmon::FaultReason::none;
+        if (scenario == respmon::SensorScenario::invalid) expected_reason = respmon::FaultReason::invalid_sample;
+        if (scenario == respmon::SensorScenario::out_of_range) expected_reason = respmon::FaultReason::out_of_range;
+        if (scenario == respmon::SensorScenario::stale_timestamp) expected_reason = respmon::FaultReason::stale_timestamp;
+        if (scenario == respmon::SensorScenario::sequence_gap ||
+            (scenario == respmon::SensorScenario::recovery && phase == 0)) expected_reason = respmon::FaultReason::sequence_gap;
+        if (scenario == respmon::SensorScenario::frozen && phase >= 3) expected_reason = respmon::FaultReason::frozen_sensor;
+        CHECK(checked.reason == expected_reason);
+        if (checked.accepted()) {
+            const auto processed = scenario_filter.process(raw);
+            CHECK(processed.sequence == sequence && processed.timestamp_ms == raw.timestamp_ms);
+            scenario_monitor.update(processed);
+        } else {
+            scenario_filter.reset();
+            scenario_monitor.on_sensor_fault(checked.reason);
+            CHECK(!scenario_filter.average().valid);
+        }
         if (phase + 1 == duration) {
+            const bool fault = scenario == respmon::SensorScenario::critical ||
+                scenario == respmon::SensorScenario::invalid || scenario == respmon::SensorScenario::out_of_range ||
+                scenario == respmon::SensorScenario::stale_timestamp || scenario == respmon::SensorScenario::sequence_gap ||
+                scenario == respmon::SensorScenario::frozen;
             const auto expected_state = scenario == respmon::SensorScenario::elevated
                 ? respmon::MonitorState::WARNING
-                : (scenario == respmon::SensorScenario::critical || invalid
-                    ? respmon::MonitorState::FAULT : respmon::MonitorState::MONITORING);
+                : (fault ? respmon::MonitorState::FAULT : respmon::MonitorState::MONITORING);
             CHECK(scenario_monitor.state() == expected_state);
-            const auto expected_fault = invalid ? respmon::FaultReason::invalid_sample
-                : (scenario == respmon::SensorScenario::critical
-                    ? respmon::FaultReason::pressure_threshold : respmon::FaultReason::none);
-            CHECK(scenario_monitor.fault() == expected_fault);
-        }
-        if (scenario == respmon::SensorScenario::recovery && phase == 0) {
-            CHECK(processed.pressure_pa == 100 && processed.airflow_ml_per_min == 40);
-            CHECK(scenario_monitor.state() == respmon::MonitorState::FAULT);
         }
     }
     sensor.reset();

@@ -26,6 +26,7 @@ struct ProcessedSample {
 enum class MonitorState : std::uint8_t { INITIALISING, MONITORING, WARNING, FAULT };
 enum class FaultReason : std::uint8_t {
     none, invalid_sample, sensor_timeout, pressure_threshold, airflow_threshold,
-    invalid_configuration
+    invalid_configuration, stale_timestamp, sequence_gap, sequence_order,
+    out_of_range, frozen_sensor
 };
 } // namespace respmon

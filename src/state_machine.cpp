@@ -28,6 +28,11 @@ const char* fault_name(FaultReason reason) noexcept
     case FaultReason::pressure_threshold: return "pressure_threshold";
     case FaultReason::airflow_threshold: return "airflow_threshold";
     case FaultReason::invalid_configuration: return "invalid_configuration";
+    case FaultReason::stale_timestamp: return "stale_timestamp";
+    case FaultReason::sequence_gap: return "sequence_gap";
+    case FaultReason::sequence_order: return "sequence_order";
+    case FaultReason::out_of_range: return "out_of_range";
+    case FaultReason::frozen_sensor: return "frozen_sensor";
     }
     return "unknown";
 }
@@ -49,6 +54,20 @@ StateMachineResult StateMachine::update(const ProcessedSample& sample) noexcept
 StateMachineResult StateMachine::on_timeout() noexcept
 {
     return evaluate(true, FaultReason::sensor_timeout);
+}
+
+StateMachineResult StateMachine::on_sensor_fault(FaultReason reason) noexcept
+{
+    if (reason == FaultReason::invalid_configuration) {
+        const auto previous_state = state_;
+        const auto previous_fault = fault_;
+        state_ = MonitorState::FAULT;
+        fault_ = reason;
+        interrupt_streaks();
+        return {state_, state_ != previous_state, fault_, fault_ != previous_fault};
+    }
+    // A caller cannot accidentally turn an integrity failure into normal input.
+    return evaluate(true, reason == FaultReason::none ? FaultReason::invalid_sample : reason);
 }
 
 StateMachineResult StateMachine::evaluate(bool abnormal, FaultReason reason) noexcept

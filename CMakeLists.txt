@@ -17,6 +17,7 @@ target_sources(app PRIVATE
     src/main.cpp
     src/pipeline.cpp
     src/filter.cpp
+    src/sensor_health.cpp
     src/sensor_simulator.cpp
     src/state_machine.cpp
 )
