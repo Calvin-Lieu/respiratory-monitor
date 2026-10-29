@@ -8,7 +8,6 @@ parser.add_argument("log", type=Path)
 parser.add_argument("--stress", action="store_true")
 args = parser.parse_args()
 raw_text = args.log.read_text()
-# Normalize Zephyr's timestamp/level/module prefix while retaining non-log lines.
 text = "\n".join(line.split("respmon: ", 1)[-1] for line in raw_text.splitlines())
 for name in ("acquisition", "monitoring", "reporting"):
     assert f"THREAD {name} started" in text, f"Missing {name} startup"
@@ -18,8 +17,7 @@ assert "QEMU: Terminated" in text, "QEMU did not exit cleanly"
 summaries = []
 counters = []
 for line in text.splitlines():
-    # QEMU's interactive exit can interrupt the final console write mid-line.
-    # Only that explicitly terminated line is excluded from snapshot checks.
+    # QEMU can interrupt the final console write when it exits.
     if "QEMU: Terminated" in line:
         continue
     if line.startswith("SUMMARY "):
